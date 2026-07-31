@@ -1,0 +1,10 @@
+# Language Identification with ESPnet-OWSM model
+# More model_tag can be from the ESPnet huggingface https://huggingface.co/espnet .
+# The default model is `espnet/owsm_v3.1_ebf`.
+# --language: the nbest language tag
+- name: lid
+  model_tag: default
+  nbest: 5
+  use_gpu: false
+
+

@@ -1,0 +1,266 @@
+import importlib.util
+from pathlib import Path
+
+import pytest
+import numpy as np
+
+from versa.definition import (
+    BaseMetric,
+    MetricCategory,
+    MetricFactory,
+    MetricMetadata,
+    MetricRegistry,
+    MetricSuite,
+    MetricType,
+)
+from versa.config_validation import (
+    ScoreConfigValidationException,
+    validate_score_config,
+)
+from versa.metric_discovery import (
+    create_metric_discovery_registry,
+    describe_metric,
+    format_metric_list,
+    recommend_config,
+)
+from versa.scorer_shared import VersaScorer, compute_summary
+from versa.utils_shared import find_files
+
+
+def _load_calculate_average_wer():
+    script_path = (
+        Path(__file__).resolve().parents[2] / "scripts" / "survey" / "get_wer.py"
+    )
+    spec = importlib.util.spec_from_file_location("versa_test_get_wer", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.calculate_average_wer
+
+
+calculate_average_wer = _load_calculate_average_wer()
+
+
+class DummyMetric(BaseMetric):
+    def _setup(self):
+        self.threshold = self.config.get("threshold", 0.5)
+
+    def compute(self, predictions, references=None, metadata=None):
+        return {"dummy": 1.0}
+
+    def get_metadata(self):
+        return DUMMY_METADATA
+
+
+DUMMY_METADATA = MetricMetadata(
+    name="dummy",
+    category=MetricCategory.INDEPENDENT,
+    metric_type=MetricType.FLOAT,
+    requires_reference=False,
+    requires_text=False,
+    gpu_compatible=False,
+    auto_install=False,
+    dependencies=["definitely_missing_dependency_for_versa_test"],
+    description="Dummy metric for registry tests.",
+)
+
+
+def _registry_with_dummy(metadata=DUMMY_METADATA):
+    registry = MetricRegistry()
+    registry.register(DummyMetric, metadata, aliases=["dummy_alias"])
+    return registry
+
+
+def test_metric_factory_create_suite_with_missing_dependency_and_default_config():
+    registry = MetricRegistry()
+    registry.register(DummyMetric, DUMMY_METADATA)
+
+    suite = MetricFactory(registry).create_metric_suite(["dummy"])
+
+    assert suite.compute_all(predictions=None) == {"dummy": {"dummy": 1.0}}
+
+
+def test_metric_registry_lists_aliases_for_metric():
+    registry = _registry_with_dummy()
+
+    assert registry.get_aliases("dummy") == ["dummy_alias"]
+    assert registry.get_aliases("dummy_alias") == ["dummy_alias"]
+    assert registry.list_aliases() == {"dummy_alias": "dummy"}
+
+
+def test_score_config_validation_accepts_known_alias_and_parameters():
+    metadata = MetricMetadata(
+        **{
+            **DUMMY_METADATA.__dict__,
+            "dependencies": [],
+        }
+    )
+    registry = _registry_with_dummy(metadata)
+
+    validate_score_config(
+        [{"name": "dummy_alias", "threshold": 0.75}],
+        registry=registry,
+    )
+
+
+def test_score_config_validation_reports_actionable_errors():
+    registry = _registry_with_dummy()
+    ref_text_metadata = MetricMetadata(
+        name="needs_ref_text",
+        category=MetricCategory.DEPENDENT,
+        metric_type=MetricType.FLOAT,
+        requires_reference=True,
+        requires_text=True,
+        gpu_compatible=False,
+        auto_install=False,
+        dependencies=[],
+        description="Needs reference audio and text.",
+    )
+    gpu_metadata = MetricMetadata(
+        name="qwen_omni_language",
+        category=MetricCategory.INDEPENDENT,
+        metric_type=MetricType.STRING,
+        requires_reference=False,
+        requires_text=False,
+        gpu_compatible=True,
+        auto_install=False,
+        dependencies=[],
+        description="GPU-required test metric.",
+    )
+    registry.register(DummyMetric, ref_text_metadata)
+    registry.register(DummyMetric, gpu_metadata)
+
+    with pytest.raises(ScoreConfigValidationException) as exc_info:
+        validate_score_config(
+            [
+                {"name": "not_a_metric"},
+                {"name": "needs_ref_text"},
+                {"name": "qwen_omni_language"},
+                {"name": "dummy", "threshlod": 0.5},
+            ],
+            registry=registry,
+            use_gt=False,
+            use_gt_text=False,
+            use_gpu=False,
+        )
+
+    message = str(exc_info.value)
+    assert "unknown metric name 'not_a_metric'" in message
+    assert "requires reference audio" in message
+    assert "requires reference text" in message
+    assert "requires GPU execution" in message
+    assert "unknown parameter(s): threshlod" in message
+
+
+def test_score_config_validation_reports_missing_optional_dependencies():
+    registry = _registry_with_dummy()
+
+    with pytest.raises(ScoreConfigValidationException, match="missing optional"):
+        validate_score_config([{"name": "dummy"}], registry=registry)
+
+
+def test_metric_discovery_describes_metric_without_instantiating_backend():
+    registry = create_metric_discovery_registry()
+
+    assert "pesq" in registry.list_metrics()
+    assert "PESQ: Perceptual Evaluation" in describe_metric(registry, "pesq")
+
+
+def test_metric_discovery_formats_filtered_list():
+    registry = create_metric_discovery_registry()
+
+    output = format_metric_list(registry)
+
+    assert "name" in output
+    assert "pesq" in output
+    assert "metric(s) available" in output
+
+
+def test_metric_discovery_recommends_tts_gpu_config():
+    output = recommend_config("tts", "gpu")
+
+    assert "task=tts, device=gpu" in output
+    assert "- name: discrete_speech" in output
+    assert "- name: whisper_wer" in output
+
+
+def test_metric_suite_compute_parallel_is_explicitly_unimplemented():
+    suite = MetricSuite({})
+
+    with pytest.raises(NotImplementedError, match="compute_parallel"):
+        suite.compute_parallel(predictions=None)
+
+
+def test_compute_summary_infers_numeric_scores_without_metric_registry():
+    score_info = [
+        {
+            "key": "utt1",
+            "pesq": 1.0,
+            "match_details": {"ok": True},
+            "ref_text": "hello",
+            "espnet_wer_insert": 1,
+        },
+        {
+            "key": "utt2",
+            "pesq": 3.0,
+            "match_details": {"ok": False},
+            "ref_text": "world",
+            "espnet_wer_insert": 2,
+        },
+    ]
+
+    assert compute_summary(score_info) == {
+        "espnet_wer_insert": 3,
+        "pesq": 2.0,
+    }
+
+
+def test_default_registry_includes_asvspoof_and_emo_vad():
+    scorer = VersaScorer()
+
+    assert scorer.registry.get_metadata("asvspoof_score").name == "asvspoof"
+    assert scorer.registry.get_metadata("emo_vad").name == "emo_vad"
+
+
+def test_find_files_preserves_nested_duplicate_basenames(tmp_path):
+    first = tmp_path / "speaker1" / "test.wav"
+    second = tmp_path / "speaker2" / "test.wav"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"")
+    second.write_bytes(b"")
+
+    files = find_files(str(tmp_path))
+
+    assert files == {
+        "speaker1/test.wav": str(first),
+        "speaker2/test.wav": str(second),
+    }
+
+
+def test_validate_audio_uses_metric_specific_minimum_length():
+    scorer = VersaScorer(MetricRegistry())
+    short_audio = np.arange(1600, dtype=np.float64)
+
+    assert not scorer._validate_audio(
+        short_audio,
+        16000,
+        "short",
+        "generated",
+        ["visqol"],
+    )
+
+
+def test_get_wer_uses_safe_parsing_and_espnet_fallback(tmp_path, capsys):
+    input_file = tmp_path / "scores.txt"
+    input_file.write_text(
+        '{"whisper_wer_equal": 8, "whisper_wer_delete": 1, '
+        '"whisper_wer_insert": 0, "whisper_wer_replace": 1}\n'
+        "{'espnet_wer_equal': 7, 'espnet_wer_delete': 0, "
+        "'espnet_wer_insert': 1, 'espnet_wer_replace': 2}\n",
+        encoding="utf-8",
+    )
+
+    calculate_average_wer(str(input_file))
+
+    assert capsys.readouterr().out.strip() == "wer: 0.2631578947368421"
